@@ -24,6 +24,9 @@ wheels/
 news_crawler_env/
 venv/
 ENV/
+bin/
+lib64
+pyvenv.cfg
 
 # IDE
 .idea/
@@ -38,10 +41,16 @@ logs/
 # Local development settings
 .env
 .env.local
+news_crawler/config/deepseek_config.py
 
 # Database
 *.db
 *.sqlite3
+
+# Data files
+*.json
+*.xlsx
+news_crawler/data/
 
 # OS
 .DS_Store
