@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 # OpenRouter配置
 DEEPSEEK_CONFIG = {
     # 优先使用环境变量，如果环境变量未设置则使用这里的配置
-    "API_KEY": os.getenv("OPENROUTER_API_KEY", "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"),  # 请设置您的OpenRouter API密钥或环境变量
+    "API_KEY": os.getenv("OPENROUTER_API_KEY", ""),  # 请设置您的OpenRouter API密钥或环境变量
     
     # OpenRouter API接口配置
     "API_BASE": os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1"),
