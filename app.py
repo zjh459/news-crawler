@@ -1,208 +1,330 @@
 """
-新闻爬虫Web应用
+Flask Web应用，用于展示爬取的新闻数据
 """
-
 import os
-import sys
-import json
 import asyncio
-import threading
-from datetime import datetime
-from flask import Flask, render_template, request, jsonify, redirect, url_for, send_file
-from concurrent.futures import ThreadPoolExecutor
+import json
+import glob
+import logging
+from datetime import datetime, timedelta
+from flask import Flask, render_template, jsonify, request, send_file
+from news_crawler.scrapers.foxnews_scraper import FoxNewsScraper
+from news_crawler.scrapers.nytimes_scraper import NYTimesScraper
+from news_crawler.scrapers.washingtonpost_scraper import WashingtonPostScraper
+from news_crawler.scrapers.cnn_scraper import CNNScraper
+from news_crawler.scrapers.bbc_scraper import BBCScraper
+from news_crawler.scrapers.wsj_scraper import WSJScraper
+from news_crawler.config.config import CRAWLER_CONFIG, NEWS_SITES
 import pandas as pd
+from io import BytesIO
 
-# 确保能够导入news_crawler包
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-# 导入爬虫相关模块
-from news_crawler.utils.crawler_runner import CrawlerRunner
-from news_crawler.config import NEWS_SITES
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("news_crawler.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# 创建必要的目录
-os.makedirs('templates', exist_ok=True)
-os.makedirs('static', exist_ok=True)
-os.makedirs('news_crawler/data', exist_ok=True)
+# 确保数据目录存在
+os.makedirs(CRAWLER_CONFIG["save_path"], exist_ok=True)
 
-# 全局变量，存储爬虫任务状态
-crawler_tasks = {}
-thread_pool = ThreadPoolExecutor(max_workers=4)
-
-def run_async_task(coro):
-    """在新的事件循环中运行协程"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+# 爬虫类映射
+SCRAPERS = {
+    "foxnews": FoxNewsScraper,
+    "nytimes": NYTimesScraper,
+    "washingtonpost": WashingtonPostScraper,
+    "cnn": CNNScraper,
+    "bbc": BBCScraper,
+    "wsj": WSJScraper
+}
 
 @app.route('/')
 def index():
-    """首页，显示爬虫配置界面"""
-    return render_template('index.html')
+    """首页"""
+    return render_template('index.html', news_sites=NEWS_SITES)
 
-@app.route('/start_crawler', methods=['POST'])
-def start_crawler():
-    """启动爬虫"""
-    crawl_type = request.form.get('crawl_type', 'foxnews')
-    max_articles = int(request.form.get('max_articles', 10))
-    save_to_db = request.form.get('save_to_db') == 'on'
-    save_to_file = request.form.get('save_to_file') == 'on'
-    custom_url = request.form.get('custom_url', '')
-    
-    # 创建任务ID
-    task_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # 启动爬虫任务
-    crawler_tasks[task_id] = {
-        'crawl_type': crawl_type,
-        'url': custom_url if crawl_type == 'url' else None,
-        'max_articles': max_articles,
-        'save_to_db': save_to_db,
-        'save_to_file': save_to_file,
-        'status': 'running',
-        'start_time': datetime.now().isoformat(),
-        'result': None
-    }
-    
-    # 在线程池中运行爬虫任务
-    thread_pool.submit(run_async_task, run_crawler(task_id))
-    
-    return redirect(url_for('tasks'))
+@app.route('/modern')
+def modern():
+    """现代风格首页"""
+    return render_template('modern.html', news_sites=NEWS_SITES)
 
-@app.route('/tasks')
-def tasks():
-    """显示爬虫任务列表"""
-    return render_template('tasks.html', tasks=crawler_tasks)
+@app.route('/light')
+def light():
+    """浅色风格首页"""
+    return render_template('light.html', news_sites=NEWS_SITES)
 
-@app.route('/task/<task_id>')
-def task_detail(task_id):
-    """显示爬虫任务详情"""
-    if task_id not in crawler_tasks:
-        return "任务不存在", 404
-    
-    task = crawler_tasks[task_id]
-    
-    # 如果任务已完成且有结果，读取结果文件
-    result_data = None
-    if task['status'] == 'completed' and task['result']:
-        try:
-            with open(task['result'], 'r', encoding='utf-8') as f:
-                result_data = json.load(f)
-        except Exception as e:
-            result_data = f"读取结果文件失败: {e}"
-    
-    return render_template('task_detail.html', task_id=task_id, task=task, result_data=result_data)
-
-@app.route('/download/<task_id>/<format>')
-def download_result(task_id, format):
-    """下载爬取结果"""
-    if task_id not in crawler_tasks:
-        return "任务不存在", 404
-    
-    task = crawler_tasks[task_id]
-    if not task['result'] or task['status'] != 'completed':
-        return "任务未完成或无结果", 404
-    
-    # 获取文件路径
-    json_file = task['result']
-    if not os.path.exists(json_file):
-        return "文件不存在", 404
+@app.route('/api/scrape')
+async def scrape():
+    """执行爬虫任务"""
+    try:
+        site = request.args.get('site', 'all')
+        results = []
         
-    # 根据格式确定下载文件
-    if format == 'json':
-        return send_file(
-            json_file,
-            mimetype='application/json',
-            as_attachment=True,
-            download_name=f"news_data_{task_id}.json"
-        )
-    elif format == 'excel':
-        # 从JSON文件路径获取Excel文件路径
-        excel_file = os.path.splitext(json_file)[0] + '.xlsx'
-        if not os.path.exists(excel_file):
-            # 如果Excel文件不存在，尝试从JSON创建
+        logger.info(f"开始爬取网站: {site}")
+        
+        if site == 'all':
+            # 爬取所有网站
+            for site_id, scraper_class in SCRAPERS.items():
+                try:
+                    logger.info(f"爬取网站: {site_id}")
+                    scraper = scraper_class()
+                    articles = await scraper.scrape()
+                    results.extend(articles)
+                    logger.info(f"成功爬取 {site_id}: {len(articles)} 条新闻")
+                except Exception as e:
+                    logger.error(f"爬取 {site_id} 失败: {str(e)}")
+        elif site in SCRAPERS:
+            # 爬取指定网站
             try:
-                with open(json_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                # 将数据转换为DataFrame
-                if isinstance(data, dict):  # 如果是多个网站的结果
-                    # 合并所有网站的数据
-                    all_articles = []
-                    for site, articles in data.items():
-                        for article in articles:
-                            article['site'] = site
-                            all_articles.append(article)
-                    df = pd.DataFrame(all_articles)
-                else:  # 如果是单个网站的结果
-                    df = pd.DataFrame(data)
-                
-                # 重新排列列的顺序
-                columns = ['title', 'url', 'publish_time', 'content', 'source', 'category', 'author', 'site']
-                existing_columns = [col for col in columns if col in df.columns]
-                other_columns = [col for col in df.columns if col not in columns]
-                final_columns = existing_columns + other_columns
-                
-                # 保存为Excel
-                df[final_columns].to_excel(excel_file, index=False, engine='openpyxl')
+                scraper = SCRAPERS[site]()
+                results = await scraper.scrape()
+                logger.info(f"成功爬取 {site}: {len(results)} 条新闻")
             except Exception as e:
-                return f"创建Excel文件失败: {str(e)}", 500
+                logger.error(f"爬取 {site} 失败: {str(e)}")
+                return jsonify({"status": "error", "message": f"爬取 {site} 失败: {str(e)}"})
+        else:
+            logger.error(f"无效的网站: {site}")
+            return jsonify({"status": "error", "message": "无效的网站"})
+        
+        return jsonify({"status": "success", "count": len(results)})
+    except Exception as e:
+        logger.error(f"爬取失败: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route('/api/news')
+async def get_news():
+    """获取新闻列表"""
+    try:
+        site = request.args.get('site', 'all')
+        date = request.args.get('date', None)  # 新增日期参数
+        
+        logger.info(f"获取新闻列表: 网站={site}, 日期={date}")
+        
+        news = []
+        
+        if site == 'all':
+            # 获取所有网站的新闻文件
+            for site_id, scraper_class in SCRAPERS.items():
+                try:
+                    scraper = scraper_class()
+                    logger.info(f"尝试获取 {site_id} 的新闻文件")
+                    if date:
+                        # 获取指定日期的新闻
+                        json_file = scraper.get_json_file_by_date(date)
+                    else:
+                        # 获取最新的新闻
+                        json_file = scraper.get_latest_json_file()
+                    
+                    if json_file:
+                        logger.info(f"{site_id} 的JSON文件: {json_file}")
+                        site_news = scraper.get_articles_from_file(json_file)
+                        logger.info(f"从 {site_id} 读取到 {len(site_news)} 条新闻")
+                        news.extend(site_news)
+                except Exception as e:
+                    logger.error(f"获取 {site_id} 新闻失败: {str(e)}")
+        else:
+            # 获取指定网站的新闻文件
+            if site in SCRAPERS:
+                scraper = SCRAPERS[site]()
+                logger.info(f"尝试获取 {site} 的新闻文件")
+                if date:
+                    # 获取指定日期的新闻
+                    json_file = scraper.get_json_file_by_date(date)
+                else:
+                    # 获取最新的新闻
+                    json_file = scraper.get_latest_json_file()
+                
+                if json_file:
+                    logger.info(f"{site} 的JSON文件: {json_file}")
+                    news = scraper.get_articles_from_file(json_file)
+                    logger.info(f"从 {site} 读取到 {len(news)} 条新闻")
+            else:
+                logger.error(f"无效的网站: {site}")
+                return jsonify({"status": "error", "message": "无效的网站"})
+        
+        # 按重要性排序
+        news.sort(key=lambda x: x.get("importance", 0), reverse=True)
+        
+        logger.info(f"获取到 {len(news)} 条新闻")
+        return jsonify({"status": "success", "news": news})
+    except Exception as e:
+        logger.error(f"获取新闻列表失败: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route('/api/dates')
+async def get_available_dates():
+    """获取可用的新闻日期列表"""
+    try:
+        site = request.args.get('site', 'all')
+        
+        logger.info(f"获取可用日期: {site}")
+        
+        dates = set()
+        
+        if site == 'all':
+            # 获取所有网站的日期
+            for site_id, scraper_class in SCRAPERS.items():
+                try:
+                    scraper = scraper_class()
+                    site_dates = scraper.get_available_dates()
+                    dates.update(site_dates)
+                except Exception as e:
+                    logger.error(f"获取 {site_id} 日期失败: {str(e)}")
+        else:
+            # 获取指定网站的日期
+            if site in SCRAPERS:
+                scraper = SCRAPERS[site]()
+                dates = scraper.get_available_dates()
+            else:
+                logger.error(f"无效的网站: {site}")
+                return jsonify({"status": "error", "message": "无效的网站"})
+        
+        # 将日期转换为列表并排序（最新的日期在前）
+        date_list = sorted(list(dates), reverse=True)
+        
+        return jsonify({"status": "success", "dates": date_list})
+    except Exception as e:
+        logger.error(f"获取可用日期失败: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route('/api/status')
+def status():
+    """获取爬虫状态"""
+    try:
+        # 获取所有JSON文件
+        json_files = glob.glob(os.path.join(CRAWLER_CONFIG["save_path"], "*.json"))
+        
+        # 统计每个网站的文章数量
+        site_counts = {}
+        total_count = 0
+        
+        for site_id in SCRAPERS.keys():
+            site_files = [f for f in json_files if f.startswith(os.path.join(CRAWLER_CONFIG["save_path"], site_id.lower()))]
+            
+            if site_files:
+                # 获取最新的文件
+                latest_file = max(site_files, key=os.path.getmtime)
+                
+                try:
+                    with open(latest_file, 'r', encoding='utf-8') as f:
+                        articles = json.load(f)
+                        site_counts[site_id] = len(articles)
+                        total_count += len(articles)
+                except Exception as e:
+                    logger.error(f"读取JSON文件失败: {str(e)}")
+                    site_counts[site_id] = 0
+            else:
+                site_counts[site_id] = 0
+        
+        return jsonify({
+            "status": "success",
+            "total_count": total_count,
+            "site_counts": site_counts,
+            "sites": list(SCRAPERS.keys()),
+            "last_update": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"获取状态失败: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route('/api/export')
+async def export_news():
+    """导出新闻数据为Excel"""
+    try:
+        site = request.args.get('site', 'all')
+        date = request.args.get('date', None)  # 新增日期参数
+        logger.info(f"导出新闻数据: 网站={site}, 日期={date}")
+        
+        news = []
+        
+        if site == 'all':
+            # 获取所有网站的新闻文件
+            for site_id, scraper_class in SCRAPERS.items():
+                try:
+                    scraper = scraper_class()
+                    if date:
+                        # 获取指定日期的新闻
+                        json_file = scraper.get_json_file_by_date(date)
+                    else:
+                        # 获取最新的新闻
+                        json_file = scraper.get_latest_json_file()
+                    
+                    if json_file:
+                        site_news = scraper.get_articles_from_file(json_file)
+                        news.extend(site_news)
+                except Exception as e:
+                    logger.error(f"获取 {site_id} 新闻失败: {str(e)}")
+        else:
+            # 获取指定网站的新闻文件
+            if site in SCRAPERS:
+                scraper = SCRAPERS[site]()
+                if date:
+                    # 获取指定日期的新闻
+                    json_file = scraper.get_json_file_by_date(date)
+                else:
+                    # 获取最新的新闻
+                    json_file = scraper.get_latest_json_file()
+                
+                if json_file:
+                    news = scraper.get_articles_from_file(json_file)
+            else:
+                return jsonify({"status": "error", "message": "无效的网站"})
+        
+        if not news:
+            return jsonify({"status": "error", "message": "没有找到新闻数据"})
+        
+        # 创建DataFrame
+        df = pd.DataFrame(news)
+        
+        # 选择要导出的列
+        columns = ['title', 'url', 'summary', 'content', 'publish_time', 'crawl_time', 'source', 'is_top_news']
+        df = df[columns]
+        
+        # 重命名列
+        column_names = {
+            'title': '标题',
+            'url': '链接',
+            'summary': '摘要',
+            'content': '内容',
+            'publish_time': '发布时间',
+            'crawl_time': '抓取时间',
+            'source': '来源',
+            'is_top_news': '是否头条'
+        }
+        df = df.rename(columns=column_names)
+        
+        # 创建Excel文件
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='新闻数据')
+        
+        output.seek(0)
+        
+        # 生成文件名
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        date_str = date if date else "latest"
+        filename = f"news_data_{site}_{date_str}_{timestamp}.xlsx"
         
         return send_file(
-            excel_file,
+            output,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             as_attachment=True,
-            download_name=f"news_data_{task_id}.xlsx"
-        )
-    else:
-        return "不支持的格式", 400
-
-async def run_crawler(task_id):
-    """运行爬虫任务"""
-    task = crawler_tasks[task_id]
-    
-    try:
-        # 创建爬虫运行器
-        runner = CrawlerRunner(
-            save_to_db=task['save_to_db'],
-            save_to_file=task['save_to_file']
+            download_name=filename
         )
         
-        # 根据抓取类型选择不同的抓取方式
-        if task['crawl_type'] == 'url' and task['url']:
-            # 抓取单个 URL
-            articles = await runner.scrape_single_url(task['url'])
-            total_articles = 1 if articles else 0
-        else:
-            # 抓取 Fox News 首页
-            articles = await runner.run_scraper('foxnews', task['max_articles'])
-            total_articles = len(articles)
-        
-        # 更新任务状态
-        task['status'] = 'completed'
-        task['end_time'] = datetime.now().isoformat()
-        task['total_articles'] = total_articles
-        
-        # 保存结果到文件
-        result_file = f"news_crawler/data/task_{task_id}.json"
-        with open(result_file, 'w', encoding='utf-8') as f:
-            json.dump(articles, f, ensure_ascii=False, indent=2)
-        
-        task['result'] = result_file
-    
     except Exception as e:
-        # 更新任务状态为失败
-        task['status'] = 'failed'
-        task['end_time'] = datetime.now().isoformat()
-        task['error'] = str(e)
-        print(f"爬虫任务失败: {e}")  # 添加错误日志
-    
-    finally:
-        # 关闭爬虫
-        runner.close()
+        logger.error(f"导出新闻数据失败: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"status": "error", "message": str(e)})
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=8080)
+    app.run(debug=True) 
